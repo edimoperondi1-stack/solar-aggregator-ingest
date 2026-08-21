@@ -1,0 +1,20 @@
+# config/plant_coordinates.toml
+# Non-secret lat/lon bridge for pvlib sunrise/sunset (Phase 4). Bridges the
+# missing plants.latitude/longitude columns — a future migration adding real
+# columns would let this file retire. DDL is OUT OF SCOPE this phase.
+# Keyed by plants.external_plant_id (see db/seed/*.sql). SEMS does not expose
+# coordinates (connectors/goodwe/discover.py prints the raw station dict; no
+# lat/lon field), so these are filled manually from the plant's known city,
+# same manual process used for the timezone field in the seeds.
+# The key is plants.external_plant_id, and it CHANGES if the plant's cadastro
+# is corrected — this happened to one of the plants in Phase 6 (migration
+# 011): its key was the wrong SEMS UUID and had to be rekeyed to the real
+# SunWEG id.
+
+["147493"]  # usina piloto (rechaveada na Fase 6: a chave era o UUID antigo do SEMS, que nunca correspondeu a esta usina)
+lat = -11.86
+lon = -55.50
+
+["236b16f4-8a64-4738-ad0b-7fd4e2055c37"]  # segunda usina
+lat = -11.86
+lon = -55.50

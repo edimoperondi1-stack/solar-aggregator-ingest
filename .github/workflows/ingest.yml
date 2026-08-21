@@ -1,0 +1,298 @@
+# Ingestao automatizada GoodWe -- Fase 3 (INGE-01..05).
+# Roda o MESMO CLI provado manualmente na Fase 2 (`python -m ingest.run`),
+# agora sozinho a cada 15 min.
+#
+# SEGURANCA: as 3 credenciais vem SO de GitHub Secrets (INGE-03/D-03).
+# Nunca adicionar steps que imprimam request bodies/headers, o token do SEMS
+# ou a connection string -- o mascaramento do GitHub e por valor literal e
+# e derrotado por transformacoes (base64, split de string, embutir em JSON).
+name: Ingestao (GoodWe + WEG)
+
+on:
+  schedule:
+    # D-01/INGE-01: minutos DESLOCADOS da borda da hora. `*/15` a partir de :00
+    # cai na janela de congestionamento documentada do GitHub, onde runs
+    # agendadas atrasam ou sao puladas. O cron do GitHub e sempre UTC.
+    - cron: '7,22,37,52 * * * *'
+  # Gatilho manual para teste/backfill, sem custo extra.
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Dias de janela por usina (default 2 = hoje + ontem)'
+        required: false
+        default: '2'
+
+# Menor privilegio por default; cada job eleva so o que precisa.
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    # D-05: um job independente por fabricante, num UNICO workflow. Isolamento
+    # real (o WEG quebrando nao derruba a ingestao Goodwe ja estavel em
+    # producao) SEM duplicar as ~130 linhas do bloco de alerta abaixo -- a
+    # matrix executa o job inteiro, incluindo aquele step, uma vez por valor.
+    # fail-fast: false e obrigatorio: sem ele, o primeiro job que falhar
+    # CANCELA o outro, que e exatamente o oposto do isolamento pretendido.
+    strategy:
+      fail-fast: false
+      matrix:
+        manufacturer: [goodwe, weg]
+    # D-09: no maximo uma ingestao por vez POR FABRICANTE. Nunca cancelar a run
+    # em andamento -- ela pode estar no meio de um commit no Postgres; a nova
+    # espera na fila. O sufixo por fabricante e novo na Fase 6 (D-05): sem
+    # ele, os dois jobs da MESMA run competiriam pelo mesmo grupo e a matrix
+    # viraria sequencial. `concurrency` de nivel de workflow nao enxerga
+    # `matrix` -- por isso o bloco vive AQUI, dentro do job, e nao no topo do
+    # arquivo.
+    concurrency:
+      group: ingest-${{ matrix.manufacturer }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    # D-09: guarda contra run pendurada. Precisa morrer bem antes do proximo
+    # cron (15 min) para nao travar o concurrency group.
+    timeout-minutes: 6
+    permissions:
+      contents: read
+      issues: write    # abrir/comentar/fechar a Issue de alerta (D-04)
+      actions: read    # listar o historico de runs deste workflow (D-06)
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Rodar ingestao
+        id: ingest
+        env:
+          # Todos os secrets dos DOIS fabricantes ficam aqui incondicionalmente.
+          # ingest/run.py::_build_connector so le as variaveis do prefixo do
+          # fabricante deste job e dos credential_ref que get_plants_by_manufacturer
+          # de fato devolveu -- as demais simplesmente nunca sao referenciadas,
+          # sem risco de KeyError. Isso evita qualquer injecao condicional de
+          # secret no YAML, que seria bem mais fragil.
+          SEMS_ACCOUNT_ACM: ${{ secrets.SEMS_ACCOUNT_ACM }}
+          SEMS_PASSWORD_ACM: ${{ secrets.SEMS_PASSWORD_ACM }}
+          SEMS_ACCOUNT_USINAS_GABRIEL: ${{ secrets.SEMS_ACCOUNT_USINAS_GABRIEL }}
+          SEMS_PASSWORD_USINAS_GABRIEL: ${{ secrets.SEMS_PASSWORD_USINAS_GABRIEL }}
+          SUNWEG_ACCOUNT_ACM: ${{ secrets.SUNWEG_ACCOUNT_ACM }}
+          SUNWEG_PASSWORD_ACM: ${{ secrets.SUNWEG_PASSWORD_ACM }}
+          SUPABASE_INGESTION_URL: ${{ secrets.SUPABASE_INGESTION_URL }}
+        run: >-
+          python -m ingest.run
+          --manufacturer=${{ matrix.manufacturer }}
+          --lookback-days=${{ github.event.inputs.lookback_days || '2' }}
+
+      - name: Alerta por-conta (abre 3-consecutivas / fecha na recuperacao)
+        if: always()
+        uses: actions/github-script@v8
+        env:
+          # Saidas do step de ingestao (Plano 02): acct_<ref>=ok|error por conta
+          # + accounts=<csv>. Ler via env (nao interpolacao direta no template)
+          # porque o nome da chave e dinamico (acct_<ref>, um por credential_ref).
+          STEP_OUTPUTS: ${{ toJSON(steps.ingest.outputs) }}
+          # matrix.* nao esta disponivel dentro do template do github-script;
+          # chega por env, mesmo padrao ja usado para STEP_OUTPUTS.
+          MANUFACTURER: ${{ matrix.manufacturer }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const outputs = JSON.parse(process.env.STEP_OUTPUTS || '{}');
+            const manufacturer = process.env.MANUFACTURER || 'goodwe';
+            core.info('Fabricante deste job da matrix: ' + manufacturer);
+
+            // D-06: a contagem de 3-consecutivas por conta vem do historico de
+            // runs do GitHub + do marcador estavel INGEST_ACCOUNT_STATUS: no
+            // log de cada run anterior -- NAO do estado gravado por-usina no
+            // Postgres -- assim a deteccao continua funcionando quando o
+            // proprio Postgres e a causa da falha.
+            const accountsCsv = outputs.accounts || '';
+            const accounts = accountsCsv ? accountsCsv.split(',').filter(Boolean) : [];
+
+            if (accounts.length === 0) {
+              core.info('Nenhuma conta processada neste run (sem saidas acct_<ref>) -- nada a fazer.');
+              return;
+            }
+
+            // Verifica se um dos 2 runs anteriores tem o marcador de erro
+            // desta conta no log do job. Pitfall 3 (03-RESEARCH.md):
+            // workflow_id e o NOME DO ARQUIVO, nao o campo `name:`.
+            async function prevRunFailedForAccount(runId, refUpper) {
+              const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: runId });
+              // Fase 6: sob `strategy: matrix`, o GitHub nomeia cada instancia
+              // como '<job_id> (<valores da matrix>)' -- 'ingest (goodwe)' e
+              // 'ingest (weg)'. AMBAS contem 'ingest', entao o .find() antigo
+              // devolvia a primeira do array (ordem NAO garantida) e podia ler o
+              // log do fabricante errado ao checar o historico de falhas.
+              //
+              // Sem fallback proposital: se nenhum job desta run casar com este
+              // fabricante (ex.: uma run ANTERIOR a matrix, com um unico job
+              // chamado 'ingest'), devolvemos false em vez de chutar. Um falso
+              // NEGATIVO (alerta atrasado uma run) e muito melhor que um falso
+              // POSITIVO (abrir issue de WEG lendo o log do Goodwe).
+              const job = jobs.data.jobs.find(
+                j => j.name.includes('ingest') && j.name.includes(manufacturer)
+              );
+              if (!job) {
+                core.info('Run ' + runId + ': nenhum job da matrix casou com o fabricante ' +
+                          manufacturer + ' -- tratando como "nao falhou" (conservador).');
+                return false;
+              }
+              const log = await github.rest.actions.downloadJobLogsForWorkflowRun({ owner, repo, job_id: job.id });
+              const text = typeof log.data === 'string' ? log.data : Buffer.from(log.data).toString('utf8');
+              return text.includes('INGEST_ACCOUNT_STATUS:' + refUpper + ':error');
+            }
+
+            // Open Question 1 (03.1-RESEARCH.md): nao confiar na ordem do
+            // array -- ordenar explicitamente por run_number decrescente.
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner, repo,
+              workflow_id: 'ingest.yml',
+              status: 'completed',
+              per_page: 10,
+            });
+            const previousRuns = data.workflow_runs
+              .filter(r => r.id !== context.runId)
+              .sort((a, b) => b.run_number - a.run_number)
+              .slice(0, 2);
+
+            for (const ref of accounts) {
+              const refLower = ref.toLowerCase();
+              const refUpper = ref.toUpperCase();
+              const status = outputs['acct_' + refLower];
+              // Fase 6 (D-05): a label precisa distinguir FABRICANTE alem de
+              // conta. D-03/D-04 permitem que uma MESMA usina tenha credencial
+              // nos DOIS portais (SEMS_ACCOUNT_<REF> e SUNWEG_ACCOUNT_<REF>,
+              // mesmo credential_ref), e os dois jobs da matrix rodam em
+              // PARALELO. Com a label antiga ('ingestion-alert-<ref>'), o job do
+              // goodwe se recuperando FECHARIA a issue que reportava a queda do
+              // sunweg -- ou os dois criariam a mesma issue numa corrida.
+              const LABEL = 'ingestion-alert-' + manufacturer + '-' + refLower;
+
+              if (status === 'ok') {
+                // Fecha qualquer Issue aberta desta conta -- recuperacao.
+                const open = await github.rest.issues.listForRepo({
+                  owner, repo, state: 'open', labels: LABEL,
+                });
+                for (const issue of open.data) {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: issue.number,
+                    body: 'Ingestao ' + manufacturer + ' da conta ' + ref + ' voltou a funcionar: ' +
+                      context.serverUrl + '/' + owner + '/' + repo + '/actions/runs/' + context.runId,
+                  });
+                  await github.rest.issues.update({
+                    owner, repo, issue_number: issue.number,
+                    state: 'closed', state_reason: 'completed',
+                  });
+                  core.info('Issue #' + issue.number + ' (conta ' + ref + ') fechada.');
+                }
+                continue;
+              }
+
+              if (status !== 'error') {
+                core.info('Conta ' + ref + ': status desconhecido (' + status + ') -- ignorando.');
+                continue;
+              }
+
+              // status === 'error' neste run -- checar as 2 runs anteriores
+              // para esta MESMA conta via o marcador de log.
+              if (previousRuns.length < 2) {
+                core.info('Conta ' + ref + ': run atual em erro, mas menos de 2 runs anteriores no historico -- ainda sem alerta.');
+                continue;
+              }
+
+              const prevResults = await Promise.all(
+                previousRuns.map(r => prevRunFailedForAccount(r.id, refUpper))
+              );
+              core.info('Conta ' + ref + ' -- runs anteriores falharam para esta conta: ' +
+                previousRuns.map((r, i) => r.run_number + '=' + prevResults[i]).join(', '));
+
+              const consecutive = prevResults.every(Boolean);
+              if (!consecutive) {
+                core.info('Conta ' + ref + ': menos de 3 falhas consecutivas -- run vermelho, mas sem Issue.');
+                continue;
+              }
+
+              // Garante o label antes de usa-lo.
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: LABEL });
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                await github.rest.issues.createLabel({
+                  owner, repo, name: LABEL, color: 'b60205',
+                  description: 'Ingestao automatizada falhando (' + manufacturer + ', conta ' + ref + ')',
+                });
+              }
+
+              const runUrl = context.serverUrl + '/' + owner + '/' + repo +
+                '/actions/runs/' + context.runId;
+              const body = [
+                'A ingestao automatizada ' + manufacturer + ' da conta ' + ref + ' falhou 3 vezes consecutivas (~45 min de dados parados).',
+                '',
+                '- Run atual (vermelho): ' + runUrl,
+                '- Runs anteriores: ' + previousRuns.map(r => '#' + r.run_number).join(', '),
+                '',
+                'Causas tipicas: login do portal (' + manufacturer + ') fora do ar para esta conta, Supabase',
+                'pausado/inacessivel, secret expirado ou rotacionado.',
+                '',
+                'Esta issue e fechada AUTOMATICAMENTE na proxima execucao bem-sucedida desta conta.',
+              ].join('\n');
+
+              // Dedupe: o estado "aberta" da propria Issue com este LABEL E a
+              // flag -- sem storage extra (D-04: uma unica issue por conta).
+              const open = await github.rest.issues.listForRepo({
+                owner, repo, state: 'open', labels: LABEL,
+              });
+              if (open.data.length === 0) {
+                const created = await github.rest.issues.create({
+                  owner, repo,
+                  title: '[ingest] ' + manufacturer + '/' + ref + ': ingestao falhando 3x consecutivas',
+                  labels: [LABEL], body,
+                });
+                core.warning('Issue de alerta aberta (conta ' + ref + '): #' + created.data.number);
+              } else {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: open.data[0].number, body,
+                });
+                core.warning('Issue de alerta ja aberta (conta ' + ref + '), atualizada: #' + open.data[0].number);
+              }
+            }
+
+  keepalive:
+    # D-07: o GitHub desativa workflows AGENDADOS apos 60 dias sem atividade
+    # no repositorio. Um commit-dummy periodico zera esse relogio.
+    # THROTTLED: so commita quando esta perto do limite (>= 50 dias), nunca
+    # a cada run -- ~2900 runs/mes nao podem virar 2900 commits.
+    # `needs: ingest` num job matrixado espera TODAS as instancias da matrix
+    # (goodwe E weg) terminarem -- comportamento documentado do Actions. Com
+    # `if: always()` isso vale inclusive quando alguma delas falha.
+    needs: ingest
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Commit-dummy so perto do limite de 60 dias
+        run: |
+          set -euo pipefail
+          last_commit_ts=$(git log -1 --format=%ct)
+          days=$(( ( $(date +%s) - last_commit_ts ) / 86400 ))
+          echo "Dias desde o ultimo commit: ${days}"
+          if [ "${days}" -ge 50 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive (${days}d sem commit) [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "Keepalive commit enviado."
+          else
+            echo "Abaixo do limiar de 50 dias -- nenhum commit feito."
+          fi

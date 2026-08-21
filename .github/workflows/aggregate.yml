@@ -1,0 +1,59 @@
+# Agregacao diaria (METR-01/METR-02) -- Fase 4 (plano 04-02).
+# Roda `python -m ingest.aggregate` uma vez ao dia, consolidando energia,
+# disponibilidade e alarm_count por usina/dia em readings_daily.
+#
+# SEGURANCA: nenhum step deve imprimir a connection string -- o mascaramento
+# do GitHub e por valor literal e e derrotado por transformacoes (base64,
+# split de string, embutir em JSON). Este job NAO faz chamadas a API de
+# nenhum vendor -- so le `readings`/`alarms` ja gravados e escreve
+# `readings_daily`, entao NAO recebe as credenciais de login do vendor usadas
+# por ingest.yml (so a connection string do Postgres, abaixo).
+name: Agregacao Diaria
+
+on:
+  schedule:
+    # 06:38 UTC ~= 03:38 America/Sao_Paulo, 02:38 America/Cuiaba -- dispara
+    # DEPOIS da meia-noite local em todos os fusos do Brasil continental
+    # (UTC-3/-4/-5, cujas meias-noites locais sao 03:00/04:00/05:00 UTC).
+    # Nao usar ~00:30 Sao Paulo (03:30 UTC): isso e ANTES da meia-noite de
+    # Cuiaba (Pitfall 6). Minuto deslocado (:38, nao :00) evita a janela de
+    # congestionamento de topo-de-hora do GitHub.
+    - cron: '38 6 * * *'
+  workflow_dispatch:
+    inputs:
+      recompute_days:
+        description: 'Janela de recomputo (default 4 = hoje + ultimos 3)'
+        required: false
+        default: '4'
+
+# No maximo uma agregacao por vez. NUNCA cancelar a run em andamento -- pode
+# estar no meio de um commit no Postgres; a nova espera na fila.
+concurrency:
+  group: aggregate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Rodar agregacao diaria
+        env:
+          SUPABASE_INGESTION_URL: ${{ secrets.SUPABASE_INGESTION_URL }}
+        run: >-
+          python -m ingest.aggregate
+          --manufacturer=goodwe
+          --recompute-days=${{ github.event.inputs.recompute_days || '4' }}

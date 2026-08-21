@@ -1,0 +1,8 @@
+httpx==0.28.1
+tenacity==9.1.4
+pydantic==2.13.4
+psycopg[binary]==3.3.4
+python-dotenv==1.2.2
+tzdata==2026.3
+pvlib==0.15.2
+pandas==3.0.3
