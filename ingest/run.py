@@ -11,6 +11,7 @@ Uso:
     python -m ingest.run --manufacturer=goodwe --dry-run
     python -m ingest.run --manufacturer=goodwe --plant <external_plant_id>
     python -m ingest.run --manufacturer=goodwe --lookback-days=2
+    python -m ingest.run --manufacturer=goodwe --no-whatsapp
 
 Fase 3 adiciona a janela self-healing (--lookback-days) e passa a rodar este
 mesmo CLI via GitHub Actions cron. Fase 4 (04-03, D-16) adiciona
@@ -18,6 +19,12 @@ mesmo CLI via GitHub Actions cron. Fase 4 (04-03, D-16) adiciona
 abertura/fechamento idempotente dos alarmes `offline`/`zero_generation`
 (METR-03), rodando logo apos o watermark de cada usina ser avancado com
 sucesso, isolado por usina (ver ingest/alarms.py).
+
+A Fase de notificacao (NOTI-01) pendura um passo a mais nesse mesmo ponto:
+cada TRANSICAO de alarme (abriu/fechou) vira uma mensagem de WhatsApp, enviada
+DEPOIS do commit e fora do try/except de alarme (ver main()). O canal e
+opcional -- sem os secrets WHATSAPP_* o CLI roda exatamente como antes. Use
+`--no-whatsapp` para silenciar um backfill manual. Ver ingest/notify.py.
 
 SECURITY: nunca logar/imprimir token, senha ou connection string (ver notas
 internas do projeto, "Secrets Handling"). Apenas nomes de usina,
@@ -53,7 +60,9 @@ from ingest.alarms import (
     open_alarm,
     within_solar_window,
 )
+from ingest.notify import build_notifier_from_env
 from ingest.solar_window import get_plant_coords, solar_window_utc
+from notifiers.base import AlarmEvent
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -93,6 +102,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "da usina (default: 2 = hoje + ontem). Janela self-healing contra "
             "atrasos/pulos do cron best-effort do GitHub Actions (INGE-02/D-02); "
             "a sobreposicao e deduplicada pelo upsert idempotente."
+        ),
+    )
+    parser.add_argument(
+        "--no-whatsapp",
+        action="store_true",
+        help=(
+            "Desliga a notificacao WhatsApp nesta execucao, mesmo com os "
+            "secrets presentes (a deteccao/gravacao de alarme continua "
+            "normal). Util para backfill manual, que reprocessa dias antigos "
+            "e nao deve reavisar ninguem."
         ),
     )
     return parser.parse_args(argv)
@@ -200,15 +219,40 @@ def detect_and_apply_alarms(
     janela solar: nao faz nada em nenhum dos dois alarmes -- nunca fecha
     (nem abre) de noite.
 
-    Retorna {"opened": N, "closed": N} (linhas de fato afetadas, via
-    cur.rowcount) para o RESUMO."""
-    counts = {"opened": 0, "closed": 0}
+    Retorna {"opened": N, "closed": N, "events": [AlarmEvent, ...]}. Os dois
+    contadores continuam sendo linhas de fato afetadas (via cur.rowcount);
+    `events` e a lista das TRANSICOES correspondentes, para notificacao.
+
+    `cur.rowcount > 0` e o que torna a notificacao nao-repetitiva de graca:
+    a abertura e `ON CONFLICT DO NOTHING` e o fechamento e `WHERE closed_at
+    IS NULL`, entao um alarme que apenas PERMANECE aberto casa 0 linhas e
+    nao gera evento nenhum. Uma usina offline por 6h notifica uma vez, nao a
+    cada 15 min. Quem envia e `main()`, e so DEPOIS do commit -- daqui nao
+    sai nenhuma chamada de rede.
+    """
+    counts: dict = {"opened": 0, "closed": 0, "events": []}
 
     tenant_id = plant["tenant_id"]
     plant_id = plant["id"]
     external_plant_id = plant["external_plant_id"]
     plant_tz = plant["timezone"]
     name = plant["name"]
+
+    def _record(transition: str, alarm_type: str, severity: str) -> None:
+        """Contabiliza a transicao e guarda o evento correspondente."""
+        counts[transition] += 1
+        counts["events"].append(
+            AlarmEvent(
+                transition=transition,
+                plant_name=name,
+                external_plant_id=external_plant_id,
+                manufacturer=manufacturer,
+                alarm_type=alarm_type,
+                severity=severity,
+                at_utc=now_utc,
+                plant_tz=plant_tz,
+            )
+        )
 
     coords = get_plant_coords(external_plant_id)
     if coords is None:
@@ -234,7 +278,7 @@ def detect_and_apply_alarms(
                 opened_at=now_utc,
             )
             if cur.rowcount:
-                counts["opened"] += 1
+                _record("opened", "offline", "warning")
         else:
             close_alarm(
                 cur,
@@ -245,7 +289,7 @@ def detect_and_apply_alarms(
                 closed_at=now_utc,
             )
             if cur.rowcount:
-                counts["closed"] += 1
+                _record("closed", "offline", "warning")
 
     # ZERO_GENERATION (D-11): janela solar COM margem (exclui sol raso).
     sunriseM, sunsetM = solar_window_utc(
@@ -265,7 +309,7 @@ def detect_and_apply_alarms(
                 opened_at=now_utc,
             )
             if cur.rowcount:
-                counts["opened"] += 1
+                _record("opened", "zero_generation", "critical")
         else:
             close_alarm(
                 cur,
@@ -276,7 +320,7 @@ def detect_and_apply_alarms(
                 closed_at=now_utc,
             )
             if cur.rowcount:
-                counts["closed"] += 1
+                _record("closed", "zero_generation", "critical")
 
     return counts
 
@@ -285,6 +329,18 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = _parse_args(argv)
     now_utc = datetime.now(timezone.utc)  # instante unico do ciclo (D-16)
+
+    # Canal de notificacao (NOTI-01): construido UMA vez por run, fora do loop
+    # -- e um httpx.Client, nao precisa de um por usina.
+    # --dry-run nunca notifica: D-04 promete "nenhum efeito colateral", e uma
+    # mensagem de WhatsApp e o efeito colateral mais visivel que existe.
+    # Sem secrets configurados, build_notifier_from_env() devolve None e tudo
+    # abaixo vira no-op -- o canal e estritamente opcional.
+    if args.dry_run or args.no_whatsapp:
+        notifier = None
+        print("WhatsApp desativado nesta execucao (--dry-run/--no-whatsapp)")
+    else:
+        notifier = build_notifier_from_env()
 
     conn = connect_as_ingestion_writer(os.environ["SUPABASE_INGESTION_URL"])
     conn.autocommit = False
@@ -317,6 +373,11 @@ def main(argv: list[str] | None = None) -> int:
         total_alarms_opened = 0
         total_alarms_closed = 0
         alarm_failures = 0
+        # Notificacoes (NOTI-01): mensagens que a Meta ACEITOU neste ciclo, e
+        # falhas do passo de envio -- isoladas, nunca contam como falha de
+        # ingestao nem de alarme.
+        total_notified = 0
+        notify_failures = 0
         # Status por conta (MTEN-03): consumido pelo alerta por-conta do
         # Plano 04. Nunca gravado no Postgres (D-06) -- so stdout/$GITHUB_OUTPUT.
         account_status: dict[str, str] = {}
@@ -463,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
                         # PROPRIO (nao o da usina inteira) -- uma falha aqui so
                         # desfaz o trabalho de alarme desta usina, nunca a
                         # ingestao ja commitada nem o watermark ja avancado.
+                        alarm_events = []
                         try:
                             alarm_counts = detect_and_apply_alarms(
                                 cur, plant, now_utc, args.manufacturer
@@ -470,12 +532,37 @@ def main(argv: list[str] | None = None) -> int:
                             conn.commit()
                             total_alarms_opened += alarm_counts["opened"]
                             total_alarms_closed += alarm_counts["closed"]
+                            alarm_events = alarm_counts["events"]
                         except Exception as alarm_exc:
                             alarm_failures += 1
                             conn.rollback()
                             print(
                                 f"  (FALHA na deteccao de alarme de {name}: {alarm_exc})"
                             )
+
+                        # Notificacao (NOTI-01) -- DEPOIS do commit acima e
+                        # FORA do try/except de alarme, de proposito:
+                        #  (a) depois do commit, para nunca avisar sobre um
+                        #      alarme que acabou em rollback (mensagem enviada
+                        #      nao tem desfazer);
+                        #  (b) fora daquele try, para um erro de rede do
+                        #      WhatsApp nao disparar o rollback() de la (a
+                        #      transacao ja fechou) nem ser contado como falha
+                        #      de deteccao de alarme.
+                        # `alarm_events` so tem as BORDAS (rowcount > 0), entao
+                        # um alarme que apenas continua aberto nao reenvia nada.
+                        if notifier is not None and alarm_events:
+                            try:
+                                total_notified += notifier.send_all(alarm_events)
+                            except Exception as notify_exc:
+                                # send_all ja e a prova de falhas por
+                                # destinatario; este except cobre so o
+                                # imprevisto, e ainda assim nao derruba a usina.
+                                notify_failures += 1
+                                print(
+                                    f"  (FALHA ao notificar alarmes de {name}: "
+                                    f"{notify_exc})"
+                                )
 
                 except Exception as exc:  # falha parcial nao aborta as demais
                     failures += 1
@@ -527,6 +614,10 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"Alarmes (METR-03): opened={total_alarms_opened} "
                 f"closed={total_alarms_closed} (falhas: {alarm_failures})"
+            )
+            print(
+                f"Notificacoes WhatsApp (NOTI-01): enviadas={total_notified} "
+                f"(falhas: {notify_failures})"
             )
         for ref, status in account_status.items():
             print(f"conta {ref}: {status}")

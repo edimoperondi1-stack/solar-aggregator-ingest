@@ -6,6 +6,11 @@
 # Nunca adicionar steps que imprimam request bodies/headers, o token do SEMS
 # ou a connection string -- o mascaramento do GitHub e por valor literal e
 # e derrotado por transformacoes (base64, split de string, embutir em JSON).
+# Isso vale igualmente para WHATSAPP_TOKEN e para os numeros de
+# WHATSAPP_ALERT_TO: como o secret e a lista CSV inteira, o mascaramento do
+# GitHub NAO cobre um numero individual extraido dela -- por isso o codigo so
+# imprime telefone via notifiers.base.mask_phone(). Lembre que os logs de
+# Actions deste repo sao PUBLICOS (o repo e publico de proposito, ver README).
 name: Ingestao (GoodWe + WEG)
 
 on:
@@ -83,6 +88,18 @@ jobs:
           SUNWEG_ACCOUNT_ACM: ${{ secrets.SUNWEG_ACCOUNT_ACM }}
           SUNWEG_PASSWORD_ACM: ${{ secrets.SUNWEG_PASSWORD_ACM }}
           SUPABASE_INGESTION_URL: ${{ secrets.SUPABASE_INGESTION_URL }}
+          # Notificacao WhatsApp (NOTI-01) -- OPCIONAL. Se estes secrets nao
+          # existirem, ${{ secrets.X }} vira string vazia,
+          # ingest/notify.py::build_notifier_from_env() devolve None e a
+          # ingestao roda exatamente como antes. Nao ha `if:` a adicionar.
+          WHATSAPP_TOKEN: ${{ secrets.WHATSAPP_TOKEN }}
+          WHATSAPP_PHONE_NUMBER_ID: ${{ secrets.WHATSAPP_PHONE_NUMBER_ID }}
+          WHATSAPP_ALERT_TO: ${{ secrets.WHATSAPP_ALERT_TO }}
+          # Nome/idioma do template aprovado. Sao secrets (nao `vars`) so para
+          # ficarem no mesmo lugar dos demais; nao ha nada sigiloso neles e o
+          # codigo tem default para os dois.
+          WHATSAPP_TEMPLATE_NAME: ${{ secrets.WHATSAPP_TEMPLATE_NAME }}
+          WHATSAPP_TEMPLATE_LANG: ${{ secrets.WHATSAPP_TEMPLATE_LANG }}
         run: >-
           python -m ingest.run
           --manufacturer=${{ matrix.manufacturer }}

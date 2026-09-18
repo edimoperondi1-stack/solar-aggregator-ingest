@@ -206,11 +206,178 @@ def _run_all():
         test_build_connector_unknown_manufacturer_raises_valueerror_naming_it,
         test_build_connector_weg_empty_env_raises_actionable_exception,
         test_manufacturer_secret_prefix_maps_exactly_goodwe_and_weg,
+        # NOTI-01 -- transicoes de alarme que viram mensagem (ver secao no fim).
+        test_detect_emits_event_when_offline_alarm_opens,
+        test_detect_emits_no_event_when_offline_alarm_merely_stays_open,
+        test_detect_emits_event_when_alarm_closes_on_recovery,
+        test_detect_emits_no_event_when_nothing_was_open_to_close,
+        test_detect_emits_critical_event_for_zero_generation,
+        test_detect_without_coordinates_returns_empty_events,
+        test_detect_outside_solar_window_emits_nothing,
+        test_detect_event_carries_plant_identity_for_the_message,
+        test_detect_counters_match_event_count,
     ]
     for t in tests:
         t()
         print(f"OK: {t.__name__}")
     print("WINDOW OK")
+
+
+# ---------------------------------------------------------------------------
+# NOTI-01 -- detect_and_apply_alarms passou a devolver tambem as TRANSICOES
+# (`events`), que sao o que vira mensagem de WhatsApp. Os casos abaixo provam
+# a garantia central do canal: notifica-se a BORDA, nunca o estado.
+#
+#  14. alarme offline que ABRE agora (rowcount 1) gera 1 evento "opened"
+#  15. alarme offline que apenas CONTINUA aberto (rowcount 0) gera 0 eventos
+#      -- esta e a prova anti-spam: 15 em 15 min sem reavisar ninguem
+#  16. recuperacao (close casa 1 linha) gera 1 evento "closed"
+#  17. recuperacao ja fechada antes (close casa 0 linhas) gera 0 eventos
+#  18. zero_generation abrindo gera evento com severity critical
+#  19. usina sem coordenadas devolve events=[] e nao levanta
+#  20. fora da janela solar (noite) nao gera evento nenhum
+#  21. o evento carrega nome/fuso/fabricante da usina (o que a mensagem usa)
+#  22. os contadores opened/closed seguem batendo com len(events)
+# ---------------------------------------------------------------------------
+
+from datetime import timezone as _timezone
+
+from ingest.run import detect_and_apply_alarms
+
+_NOW = datetime(2026, 7, 21, 15, 0, 0, tzinfo=_timezone.utc)
+_SUNRISE = datetime(2026, 7, 21, 10, 0, 0, tzinfo=_timezone.utc)
+_SUNSET = datetime(2026, 7, 21, 21, 0, 0, tzinfo=_timezone.utc)
+
+_PLANT = {
+    "id": 1,
+    "tenant_id": 1,
+    "external_plant_id": "147493",
+    "name": "Usina Piloto",
+    "timezone": CUIABA,
+}
+
+
+class _FakeCursor:
+    """So precisa de `rowcount` -- todo SQL real esta mockado nestes casos."""
+
+    rowcount = 0
+
+
+def _run_detect(
+    *,
+    open_rows=None,
+    close_rows=None,
+    watermark=None,
+    power=(),
+    coords=(-11.86, -55.50),
+    window=(_SUNRISE, _SUNSET),
+):
+    """Roda detect_and_apply_alarms com todo o I/O (coords, pvlib, banco)
+    mockado, controlando exatamente quantas linhas cada open/close casa."""
+    open_rows = open_rows or {}
+    close_rows = close_rows or {}
+
+    def fake_open(cur, **kw):
+        cur.rowcount = open_rows.get(kw["alarm_type"], 0)
+
+    def fake_close(cur, **kw):
+        cur.rowcount = close_rows.get(kw["alarm_type"], 0)
+
+    with mock.patch("ingest.run.get_plant_coords", return_value=coords), \
+         mock.patch("ingest.run.solar_window_utc", return_value=window), \
+         mock.patch("ingest.run.get_watermark", return_value=watermark), \
+         mock.patch("ingest.run.fetch_power_readings", return_value=list(power)), \
+         mock.patch("ingest.run.open_alarm", side_effect=fake_open), \
+         mock.patch("ingest.run.close_alarm", side_effect=fake_close):
+        return detect_and_apply_alarms(_FakeCursor(), _PLANT, _NOW, "goodwe")
+
+
+def test_detect_emits_event_when_offline_alarm_opens():
+    # Sem watermark => offline (D-10); o INSERT casou 1 linha => borda.
+    result = _run_detect(open_rows={"offline": 1}, watermark=None)
+    opened = [e for e in result["events"] if e.transition == "opened"]
+    assert len(opened) == 1
+    assert opened[0].alarm_type == "offline"
+    assert opened[0].severity == "warning"
+
+
+def test_detect_emits_no_event_when_offline_alarm_merely_stays_open():
+    # Mesma condicao offline, mas ON CONFLICT DO NOTHING casou 0 linhas: o
+    # alarme JA estava aberto. Nada de novo a avisar -- este e o caso que
+    # impede 96 mensagens por dia para uma usina offline.
+    result = _run_detect(open_rows={"offline": 0}, watermark=None)
+    assert result["events"] == []
+    assert result["opened"] == 0
+
+
+def test_detect_emits_event_when_alarm_closes_on_recovery():
+    # Watermark fresco => nao esta offline => tenta fechar, e casou 1 linha.
+    result = _run_detect(close_rows={"offline": 1}, watermark=_NOW)
+    closed = [e for e in result["events"] if e.transition == "closed"]
+    assert len(closed) == 1
+    assert closed[0].alarm_type == "offline"
+
+
+def test_detect_emits_no_event_when_nothing_was_open_to_close():
+    # Caso normalissimo: usina saudavel, nenhum alarme aberto. O UPDATE casa
+    # 0 linhas todo ciclo -- e nao pode virar mensagem de "resolvido".
+    result = _run_detect(close_rows={"offline": 0}, watermark=_NOW)
+    assert result["events"] == []
+    assert result["closed"] == 0
+
+
+def test_detect_emits_critical_event_for_zero_generation():
+    # 4 leituras consecutivas quase-zero (D-11) dentro da janela com margem.
+    result = _run_detect(
+        open_rows={"zero_generation": 1},
+        watermark=_NOW,
+        power=[0.0, 10.0, 5.0, 2.0],
+    )
+    zero = [e for e in result["events"] if e.alarm_type == "zero_generation"]
+    assert len(zero) == 1
+    assert zero[0].severity == "critical"
+    assert zero[0].transition == "opened"
+
+
+def test_detect_without_coordinates_returns_empty_events():
+    result = _run_detect(coords=None)
+    assert result == {"opened": 0, "closed": 0, "events": []}
+
+
+def test_detect_outside_solar_window_emits_nothing():
+    # Janela ja encerrada as 12:00 UTC, evento as 15:00 UTC => noite para
+    # esta usina. Nunca abrir NEM fechar de noite (D-10).
+    night = (
+        datetime(2026, 7, 21, 10, 0, 0, tzinfo=_timezone.utc),
+        datetime(2026, 7, 21, 12, 0, 0, tzinfo=_timezone.utc),
+    )
+    result = _run_detect(
+        open_rows={"offline": 1, "zero_generation": 1},
+        watermark=None,
+        window=night,
+    )
+    assert result["events"] == []
+
+
+def test_detect_event_carries_plant_identity_for_the_message():
+    result = _run_detect(open_rows={"offline": 1}, watermark=None)
+    event = result["events"][0]
+    assert event.plant_name == "Usina Piloto"
+    assert event.external_plant_id == "147493"
+    assert event.plant_tz == CUIABA
+    assert event.manufacturer == "goodwe"
+    assert event.at_utc == _NOW
+
+
+def test_detect_counters_match_event_count():
+    result = _run_detect(
+        open_rows={"offline": 1, "zero_generation": 1},
+        watermark=None,
+        power=[0.0, 0.0, 0.0, 0.0],
+    )
+    assert result["opened"] == 2
+    assert result["closed"] == 0
+    assert len(result["events"]) == result["opened"] + result["closed"]
 
 
 if __name__ == "__main__":
